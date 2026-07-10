@@ -63,6 +63,57 @@ if (!TOKEN) {
 }
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 
+// Optional role-hook integration: when BOTH env vars are set, the server
+// writes the inbound sender's derived role ('owner' or 'contributor') to
+// DISCORD_ROLE_HOOK_FILE on every delivered message, and adds a `role`
+// attribute to the MCP notification's meta. Lets downstream Claude Code
+// hooks (e.g. PreToolUse) do filesystem-level role gating without parsing
+// the MCP stream. No-op when either env var is empty — fully backward
+// compatible. Mirrors the same pattern used by the Slack channel plugin
+// (SLACK_ROLE_HOOK_FILE / OWNER_SLACK_USER_ID).
+//
+// Role derivation is pure user_id (Discord snowflake) equality — snowflakes
+// are set by Discord, not by message content, so the role hook does not
+// introduce a new prompt-injection surface. The plugin itself does NOT
+// enforce role-based tool gating; access.json / gate() remains the
+// in-plugin authority. The role hook exists for host integrations that
+// need to gate at the filesystem layer.
+const OWNER_USER_ID = process.env.OWNER_DISCORD_USER_ID || ''
+const ROLE_HOOK_FILE = process.env.DISCORD_ROLE_HOOK_FILE || ''
+const ROLE_HOOK_ENABLED = OWNER_USER_ID !== '' && ROLE_HOOK_FILE !== ''
+
+type SenderRole = 'owner' | 'contributor'
+
+/** Derive a sender's role for the optional role-hook integration.
+ *
+ *  A message's sender is "owner" iff their Discord user_id (snowflake)
+ *  matches the configured OWNER_DISCORD_USER_ID exactly; everyone else is
+ *  "contributor". Returns "contributor" for the empty-owner sentinel so a
+ *  misconfigured OWNER_DISCORD_USER_ID="" does not silently promote
+ *  everyone to owner. */
+function deriveRoleForSender(senderUserId: string, ownerUserId: string): SenderRole {
+  if (!ownerUserId) return 'contributor'
+  return senderUserId === ownerUserId ? 'owner' : 'contributor'
+}
+
+/** Atomically write the resolved role to DISCORD_ROLE_HOOK_FILE.
+ *
+ *  Write to a sibling tmp file then rename so a concurrent reader (the
+ *  PreToolUse hook) never observes a half-written file. Best-effort: errors
+ *  are logged and swallowed — failing to write the hook file MUST NOT block
+ *  inbound message delivery to Claude. */
+function writeRoleHookFileAtomic(filePath: string, role: SenderRole): void {
+  const tmp = `${filePath}.${process.pid}.tmp`
+  try {
+    writeFileSync(tmp, `${role}\n`, { mode: 0o600 })
+    renameSync(tmp, filePath)
+  } catch (err) {
+    process.stderr.write(
+      `discord channel: failed to write role hook file ${filePath}: ${err instanceof Error ? err.message : String(err)}\n`,
+    )
+  }
+}
+
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
 process.on('unhandledRejection', err => {
@@ -872,19 +923,27 @@ async function handleInbound(msg: Message): Promise<void> {
   // forgeable by any allowlisted sender typing that string.
   const content = msg.content || (atts.length > 0 ? '(attachment)' : '')
 
+  const meta: Record<string, string> = {
+    chat_id,
+    message_id: msg.id,
+    user: msg.author.username,
+    user_id: msg.author.id,
+    ts: msg.createdAt.toISOString(),
+    ...(atts.length > 0 ? { attachment_count: String(atts.length), attachments: atts.join('; ') } : {}),
+  }
+
+  // Optional role-hook integration (no-op unless OWNER_DISCORD_USER_ID +
+  // DISCORD_ROLE_HOOK_FILE are both set; see boot-time constants above).
+  // user_id is the trustworthy Discord-set identifier (snowflake).
+  if (ROLE_HOOK_ENABLED) {
+    const role = deriveRoleForSender(msg.author.id, OWNER_USER_ID)
+    meta.role = role
+    writeRoleHookFileAtomic(ROLE_HOOK_FILE, role)
+  }
+
   mcp.notification({
     method: 'notifications/claude/channel',
-    params: {
-      content,
-      meta: {
-        chat_id,
-        message_id: msg.id,
-        user: msg.author.username,
-        user_id: msg.author.id,
-        ts: msg.createdAt.toISOString(),
-        ...(atts.length > 0 ? { attachment_count: String(atts.length), attachments: atts.join('; ') } : {}),
-      },
-    },
+    params: { content, meta },
   }).catch(err => {
     process.stderr.write(`discord channel: failed to deliver inbound to Claude: ${err}\n`)
   })

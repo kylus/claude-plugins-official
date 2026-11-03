@@ -32,7 +32,8 @@ import {
 import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
-import { join, sep } from 'path'
+import { join } from 'path'
+import { assertSendable as assertSendableAt } from './sendable'
 
 const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -186,17 +187,10 @@ const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
 // reply's files param takes any path. .env is ~60 bytes and ships as an
 // upload. Claude can already Read+paste file contents, so this isn't a new
 // exfil channel for arbitrary paths — but the server's own state is the one
-// thing Claude has no reason to ever send.
+// thing Claude has no reason to ever send. The rule itself lives in
+// sendable.ts (with tests) and also covers bot.env / .env / other .*-state.
 function assertSendable(f: string): void {
-  let real, stateReal: string
-  try {
-    real = realpathSync(f)
-    stateReal = realpathSync(STATE_DIR)
-  } catch { return } // statSync will fail properly; or STATE_DIR absent → nothing to leak
-  const inbox = join(stateReal, 'inbox')
-  if (real.startsWith(stateReal + sep) && !real.startsWith(inbox + sep)) {
-    throw new Error(`refusing to send channel state: ${f}`)
-  }
+  assertSendableAt(f, STATE_DIR)
 }
 
 function readAccessFile(): Access {
